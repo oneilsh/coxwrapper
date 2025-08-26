@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Union
-from google.cloud import bigquery
 import yaml
 import os
 import logging
@@ -11,7 +10,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Mock environment variables for local testing if not in AoU Workbench
 # os.environ["WORKSPACE_CDR"] = "all-of-us-research-workbench-####.r2023q3_unzipped_data"
-# os.environ["GOOGLE_CLOUD_PROJECT"] = "your-gcp-project-id"
 
 def load_configuration(config_filepath: str) -> Dict[str, Any]:
     """Load configuration from a YAML file."""
@@ -230,14 +228,14 @@ def get_all_outcome_events_query(outcome_config: Dict[str, Any], cdr_path: str) 
 def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
     """
     Loads data from Google BigQuery based on the provided configuration.
+    Uses pd.read_gbq() compatible with AoU environment authentication.
     Implements cohort construction, random time_0 selection, and time-to-event outcome derivation.
     """
-    client = bigquery.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT"))
     cdr_path = get_aou_cdr_path()
 
     logging.info("Step 1: Fetching base person demographic data.")
     base_person_query = build_person_base_query(config)
-    person_df = client.query(base_person_query).to_dataframe()
+    person_df = pd.read_gbq(base_person_query)
     logging.info(f"Base person data loaded. Shape: {person_df.shape}")
 
     if person_df.empty:
@@ -246,16 +244,16 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
 
     logging.info("Step 2: Fetching observation periods for all persons.")
     obs_period_query = get_observation_periods_query(cdr_path)
-    obs_period_df = client.query(obs_period_query).to_dataframe()
+    obs_period_df = pd.read_gbq(obs_period_query)
     logging.info(f"Observation periods loaded. Shape: {obs_period_df.shape}")
 
     logging.info(f"Step 3: Fetching all outcome events (COPD) for potential filtering.")
     outcome_config = config.get('outcome')
     if not outcome_config or 'domain' not in outcome_config:
         raise ValueError("Outcome configuration missing or incomplete in YAML.")
-    
+
     all_outcome_events_query = get_all_outcome_events_query(outcome_config, cdr_path)
-    all_outcome_events_df = client.query(all_outcome_events_query).to_dataframe()
+    all_outcome_events_df = pd.read_gbq(all_outcome_events_query)
     logging.info(f"All outcome events loaded. Shape: {all_outcome_events_df.shape}")
 
     # --- Step 4: Determine a single random time_0 for each person ---
@@ -380,9 +378,6 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
         feature_name = feature_config['name']
         feature_domain = feature_config['domain']
 
-        feature_domain = feature_config['domain'] # This is the line that's failing
-
-
         if feature_name in excluded_from_feature_extraction or feature_domain == 'person': # Person features already in base query
             continue
 
@@ -391,8 +386,8 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
         raw_events_query = build_domain_events_query(feature_domain, feature_config, cdr_path)
         if not raw_events_query: # Skip if build_domain_events_query returned empty (unsupported domain)
             continue
-        
-        feature_events_df = client.query(raw_events_query).to_dataframe()
+
+        feature_events_df = pd.read_gbq(raw_events_query)
         logging.info(f"Raw events for {feature_name} loaded. Shape: {feature_events_df.shape}")
 
         if feature_events_df.empty:
@@ -578,19 +573,18 @@ def stratify_by_risk(df: pd.DataFrame, risk_column: str, threshold: float) -> pd
 if __name__ == "__main__":
     # This block is for direct testing of the dataloader.py script
     # It assumes environment variables are set and a config.yaml exists at root.
-    # For local testing, ensure WORKSPACE_CDR and GOOGLE_CLOUD_PROJECT are mocked/set.
-    
+    # For local testing, ensure WORKSPACE_CDR is mocked/set.
+
     # IMPORTANT: Adjust this path to your configuration.yaml if running directly
     config_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'configuration.yaml')
-    
+
     # Mock AoU environment variables for local test (if not in Workbench)
-    # Be sure to set these to valid values for your BigQuery project if testing
-    # os.environ["WORKSPACE_CDR"] = "all-of-us-research-workbench-####.r2023q3_unzipped_data" 
-    # os.environ["GOOGLE_CLOUD_PROJECT"] = "your-gcp-project-id" 
-    
-    if "WORKSPACE_CDR" not in os.environ or "GOOGLE_CLOUD_PROJECT" not in os.environ:
-        logging.error("ERROR: WORKSPACE_CDR and GOOGLE_CLOUD_PROJECT environment variables MUST be set for dataloader.py to run directly.")
-        logging.error("Please uncomment and set them in the script or ensure your environment is configured (e.g., in AoU Workbench).")
+    # Be sure to set this to a valid value for your BigQuery project if testing
+    # os.environ["WORKSPACE_CDR"] = "all-of-us-research-workbench-####.r2023q3_unzipped_data"
+
+    if "WORKSPACE_CDR" not in os.environ:
+        logging.error("ERROR: WORKSPACE_CDR environment variable MUST be set for dataloader.py to run directly.")
+        logging.error("Please uncomment and set it in the script or ensure your environment is configured (e.g., in AoU Workbench).")
         exit() # Exit if environment not set for direct run
 
     try:
