@@ -1,0 +1,201 @@
+# This YAML file defines concepts, co-indicators, and features
+# for health outcomes analysis in All of Us (AOU) data.
+# It serves as a configuration template for data extraction and ML model inputs.
+
+metadata:
+  schema_version: 1.1.0 # Updated schema version to reflect changes
+  description: "Definition of COPD, related co-indicators, and relevant features for analysis, with explicit lookback strategies."
+  created_date: "2025-06-20" # Updated to current date
+
+# --- Global Cohort Parameters ---
+# These parameters guide the random time_0 selection in the dataloader.
+cohort_parameters:
+  min_lookback_days: 365  # Minimum historical data required prior to time_0 (e.g., 1 year)
+  min_followup_days: 1825 # Minimum follow-up data required after time_0 (e.g., 5 years)
+
+# Primary target condition or outcome for this specific analysis configuration
+outcome:
+  name: copd
+  domain: condition_occurrence # This is the domain where the outcome event will be identified
+  description: Diagnosis of chronic obstructive pulmonary disease (COPD)
+  concepts_include:
+    # Original broad COPD concepts (SNOMED codes)
+    - 255573      # COPD (general)
+    - 321316      # chronic bronchitis
+    - 312327      # emphysema (original)
+    # More granular SNOMED child concepts for COPD and related conditions
+    - 46274062    # Asthma-chronic obstructive pulmonary disease overlap syndrome
+    - 44791725    # Very severe chronic obstructive pulmonary disease
+    - 313299006   # Severe chronic obstructive pulmonary disease
+    - 313297008   # Moderate chronic obstructive pulmonary disease
+    - 313296004   # Mild chronic obstructive pulmonary disease
+    - 135836000   # End stage chronic obstructive airways disease
+    - 47938003    # Chronic obliterative bronchiolitis
+    - 7433001     # Pulmonary emphysema (additional specific code)
+    - 196001008   # Chronic obstructive pulmonary disease with acute lower respiratory infection
+    - 195951007   # Acute exacerbation of chronic obstructive airways disease
+  concepts_exclude: [4288734] # SNOMED code for Bronchiolar disease
+  # Note: The dataloader will use these concepts to determine the 'first event after time_0'
+  # and derive 'time_to_event_days' and 'event_observed'.
+
+# Co-morbidities or related conditions that serve as indicators alongside the target condition
+co_indicators:
+  - name: obesity
+    domain: "condition_occurrence"
+    description: Diagnosis of obesity (chronic condition)
+    # For chronic conditions, we primarily look for presence at time_0 via condition_era
+    primary_domain: condition_occurrence # Explicitly use condition_era for presence check
+    lookback_strategy: chronic_ongoing # Assume presence if started anytime before time_0 and not ended
+    concepts_include:
+      - 4433736    # SNOMED code for obesity
+    concepts_exclude: []
+
+  - name: diabetes
+    domain: "condition_occurrence"
+    description: Diagnosis of type 2 diabetes mellitus (chronic condition)
+    primary_domain: condition_occurrence # Explicitly use condition_era for presence check
+    lookback_strategy: chronic_ongoing # Assume presence if started anytime before time_0 and not ended
+    concepts_include:
+      - 201826     # SNOMED code for type 2 diabetes mellitus
+    concepts_exclude: []
+
+  - name: cardiovascular_disease
+    domain: condition_occurrence
+    description: History of cardiovascular diseases (chronic condition)
+    primary_domain: condition_occurrence # Explicitly use condition_era for presence check
+    lookback_strategy: chronic_ongoing # Assume presence if started anytime before time_0 and not ended
+    concepts_include:
+      - 319835     # SNOMED code for heart failure
+      - 312327     # SNOMED code for myocardial infarction
+      # RECOMMENDATION: Expand this list significantly to cover major CVDs like hypertension, stroke, CAD, etc.
+      # Example concepts (placeholder for full list):
+      # - 4307855   # Hypertension
+      # - 442797    # Atrial fibrillation
+      # - 317009    # Cerebrovascular accident (Stroke)
+      # - 4048384   # Coronary artery disease
+    concepts_exclude: []
+
+# Individual variables or characteristics to be extracted for modeling
+features:
+  - name: smoking_status
+    domain: observation
+    type: categorical
+    description: Consolidated smoking status from various sources
+    lookback_strategy: recent_fixed # Use most recent status within a fixed window
+    lookback_window_days: 365 # 1 year lookback
+    consolidation_method: most_recent # Take the most recent status across all sources
+    sources: # Define the specific OMOP sources to check for this feature
+      - domain: observation
+        concepts_include: [1585856] # SNOMED code for current, former, never smoker observations
+        concepts_exclude: []
+      - domain: measurement
+        concepts_include: [40652439] # SNOMED code for smoking status via measurement (e.g., cotinine levels)
+        concepts_exclude: []
+      - domain: observation # Assuming ds_survey maps to observation in AoU
+        concepts_include: [45880274] # Specific AoU survey concept for smoking status
+        concepts_exclude: []
+
+  - name: alcohol_use
+    domain: observation
+    type: binary # Or categorical if "never", "occasional", "heavy" are distinct values
+    description: Consolidated alcohol use status/history
+    lookback_strategy: recent_fixed # Look for recent use/condition
+    lookback_window_days: 365 # 1 year lookback
+    consolidation_method: prioritize_condition_then_most_recent_obs # Prioritize clinical diagnosis over survey/measurement
+    sources:
+      - domain: observation # Assuming ds_survey maps to observation in AoU
+        concepts_include: [36310580] # AoU survey concept for alcohol use
+        concepts_exclude: []
+      - domain: condition_occurrence
+        concepts_include: [433753] # Alcohol related condition (e.g., alcohol dependence)
+        concepts_exclude: []
+      - domain: measurement
+        concepts_include: [46257550] # Alcohol related measurement (e.g., AUDIT score)
+        concepts_exclude: []
+
+  - name: bmi
+    domain: measurement
+    type: continuous
+    description: Body Mass Index (BMI)
+    lookback_strategy: most_recent_fixed # Use the most recent BMI within the window
+    lookback_window_days: 365 # 1 year lookback
+    concepts_include:
+      - 3038553    # OMOP concept ID for BMI
+    concepts_exclude: []
+
+  - name: year_of_birth
+    domain: person
+    type: continuous # Will be used by dataloader to calculate 'age_at_time_0'
+    description: Year of birth from the person table (used for age calculation)
+    # No specific concepts_include/exclude as it's a direct field from PERSON table.
+    concepts_include: []
+    concepts_exclude: []
+    
+  - name: age_at_time_0 
+    domain: person
+    type: continuous
+    description: Age of person at time_0 (calculated by dataloader) 
+    concepts_include: []
+    concepts_exclude: []
+  
+# --- NEW SECTION FOR MODEL INPUT/OUTPUT COLUMN NAMES ---
+model_io_columns:
+  duration_col: time_to_event_days  # This is the derived column name for event duration
+  event_col: event_observed        # This is the derived column name for event indicator
+  
+model_features_final:
+  - ethnicity
+  - sex_at_birth
+  - obesity
+  - diabetes
+  - cardiovascular_disease
+  - smoking_status
+  - alcohol_use
+  - bmi
+  - age_at_time_0
+
+# --- Features REMOVED to prevent data leakage and for clarity ---
+# The following features have been removed from this 'features' section because
+# they are now used by the 'dataloader.py' to:
+# 1. Define the 'time_to_event_days' and 'event_observed' for the Cox model.
+# 2. Derive other necessary time-related information internally.
+# Including them as independent 'features' here would represent data leakage
+# if they refer to the outcome event (COPD).
+
+# - name: condition_duration
+#   domain: condition_occurrence
+#   type: continuous
+#   description: Total observation duration in days from first to last condition event.
+#   concepts_include: []
+#   concepts_exclude: []
+
+# - name: condition_start_datetimes
+#   domain: condition_occurrence
+#   type: temporal_summary
+#   description: First recorded start date for COPD conditions.
+#   concepts_include: []
+#   concepts_exclude: []
+
+# - name: condition_end_datetimes
+#   domain: condition_occurrence
+#   type: temporal_summary
+#   description: Last recorded end date for COPD conditions.
+#   concepts_include: []
+#   concepts_exclude: []
+
+# --- Optional/Future Features (commented out) ---
+# - name: education_level
+#   domain: observation
+#   type: categorical
+# #   description: Highest education level attained
+# #   concepts_include:
+# #     - 1585249
+# #   concepts_exclude: []
+
+# - name: housing_insecurity
+# #   domain: observation
+# #   type: binary
+# #   description: Reported housing insecurity or instability
+# #   concepts_include:
+# #     - 765063
+# #   concepts_exclude: []
