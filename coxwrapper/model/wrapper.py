@@ -26,11 +26,63 @@ logger = logging.getLogger(__name__)
 class CoxModelWrapper:
     """
     Simplified wrapper for Cox proportional hazards modeling on All of Us data.
-    
+
     This class provides a clean API that wraps the existing twinsight_model
     functionality, making it easier to use while maintaining full compatibility.
     """
-    
+
+    @classmethod
+    def from_pickle(cls, filepath: str) -> 'CoxModelWrapper':
+        """
+        Load a CoxModelWrapper instance from a pickle file.
+
+        Args:
+            filepath: Path to the pickle file containing the saved model
+
+        Returns:
+            CoxModelWrapper: Loaded instance with trained model and all state
+
+        Raises:
+            FileNotFoundError: If the pickle file doesn't exist
+            ValueError: If the pickle file doesn't contain valid CoxModelWrapper data
+        """
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Pickle file not found: {filepath}")
+
+        try:
+            with open(filepath, 'rb') as f:
+                saved_data = pickle.load(f)
+
+            # Validate that this is a CoxModelWrapper pickle
+            required_keys = ['config', 'training_stats', 'feature_names', 'version']
+            if not all(key in saved_data for key in required_keys):
+                raise ValueError("Invalid CoxModelWrapper pickle file: missing required data")
+
+            # Create new instance with saved config
+            instance = cls(saved_data['config'])
+
+            # Restore the trained model state
+            instance.model = saved_data.get('model')
+            instance.preprocessor = saved_data.get('preprocessor')
+            instance.training_stats = saved_data.get('training_stats')
+            instance.feature_names = saved_data.get('feature_names', [])
+            instance.raw_feature_names = saved_data.get('raw_feature_names', [])
+            instance.data_summary = saved_data.get('data_summary')
+            instance.outcome_name = saved_data.get('outcome_name', instance.outcome_name)
+            instance.duration_col = saved_data.get('duration_col', instance.duration_col)
+            instance.event_col = saved_data.get('event_col', instance.event_col)
+            instance.config_source = saved_data.get('config_source', 'loaded_from_pickle')
+
+            logger.info(f"CoxModelWrapper loaded from {filepath}")
+            logger.info(f"Model version: {saved_data.get('version', 'unknown')}")
+            logger.info(f"Features: {len(instance.feature_names)} processed, {len(instance.raw_feature_names)} raw")
+
+            return instance
+
+        except Exception as e:
+            logger.error(f"Failed to load CoxModelWrapper from {filepath}: {e}")
+            raise
+
     def __init__(self, config: Union[str, Dict]):
         """
         Initialize the Cox model wrapper.
@@ -216,18 +268,18 @@ class CoxModelWrapper:
         
         return df
     
-    def _mask_small_counts(self, count: int, threshold: int = 20) -> Union[int, str]:
+    def _mask_small_counts(self, count: Union[int, float], threshold: int = 20) -> Union[int, float, str]:
         """
         Apply privacy masking to small counts per AoU requirements.
-        
+
         Args:
-            count: The count to potentially mask
+            count: The count to potentially mask (int or float)
             threshold: Counts between 1 and threshold (inclusive) are masked
-            
+
         Returns:
-            Original count if >= threshold or == 0, otherwise "<threshold"
+            Original count if >= threshold or == 0, otherwise "<threshold + 1"
         """
-        if 1 <= count <= threshold:
+        if isinstance(count, (int, float)) and 1 <= count <= threshold:
             return f"<{threshold + 1}"  # Per AoU: mask 1-20 as "<21"
         return count
     
@@ -450,8 +502,10 @@ class CoxModelWrapper:
             )
             
             # Get baseline survival function
-            baseline_survival = self.model.baseline_survival_
-            
+            baseline_survival = getattr(self.model, 'baseline_survival_', None)
+            if baseline_survival is None:
+                raise RuntimeError("Model does not have baseline survival function. Make sure the model was trained properly.")
+
             # Calculate predictions for each patient
             predictions = []
             for i, (idx, patient_features) in enumerate(X_processed.iterrows()):
@@ -460,16 +514,30 @@ class CoxModelWrapper:
                     risk_score = self.model.predict_partial_hazard(patient_features)
                     
                     # Calculate survival probabilities at different time points
-                    # Use median follow-up time from training data as reference
-                    median_time = self.data[self.duration_col].median()
-                    
+                    # Use median follow-up time from training data as reference, or default if not available
+                    if self.data is not None and self.duration_col in self.data.columns:
+                        median_time = self.data[self.duration_col].median()
+                    else:
+                        # Use default time when data not available (e.g., loaded from pickle)
+                        median_time = 365 * 2  # Default 2 years in days
+                        logger.info(f"Using default median time: {median_time} days (training data not available)")
+
                     # Get survival probability at median time
                     survival_prob = self.model.predict_survival_function(
                         patient_features, times=[median_time]
                     ).iloc[0, 0]
-                    
+
                     # Calculate relative risk (compared to baseline)
-                    baseline_surv_at_time = baseline_survival.loc[median_time].iloc[0] if median_time in baseline_survival.index else baseline_survival.iloc[0, 0]
+                    # Use baseline survival at the median time, or closest available time
+                    if median_time in baseline_survival.index:
+                        baseline_surv_at_time = baseline_survival.loc[median_time].iloc[0]
+                    else:
+                        # Find closest time in baseline survival
+                        available_times = baseline_survival.index
+                        closest_time = available_times[abs(available_times - median_time).argmin()]
+                        baseline_surv_at_time = baseline_survival.loc[closest_time].iloc[0]
+                        logger.info(f"Using baseline survival at closest time: {closest_time} instead of {median_time}")
+
                     relative_risk = baseline_surv_at_time / survival_prob if survival_prob > 0 else float('inf')
                     
                     # Risk categories based on survival probability
@@ -566,29 +634,38 @@ class CoxModelWrapper:
     def save_pickle(self, filepath: str):
         """
         Save the trained model to a pickle file.
-        
+
         Args:
             filepath: Path where to save the model
-            
-        Note: This is a placeholder implementation for now
         """
         if self.model is None:
             raise RuntimeError("No trained model. Call train() first.")
-        
+
         logger.info(f"Saving model to {filepath}...")
-        
-        # TODO: Implement privacy-compliant saving
-        # For now, just save the model object
+
+        # Save all necessary data for complete model restoration
+        # Note: We save data_summary (which has privacy masking) but not raw data
+        save_data = {
+            'model': self.model,
+            'preprocessor': self.preprocessor,
+            'config': self.config,
+            'training_stats': self.training_stats,
+            'feature_names': self.feature_names,
+            'raw_feature_names': self.raw_feature_names,
+            'data_summary': self.data_summary,  # This already has privacy masking
+            'outcome_name': self.outcome_name,
+            'duration_col': self.duration_col,
+            'event_col': self.event_col,
+            'version': '0.2.0',
+            'config_source': self.config_source
+        }
+
         with open(filepath, 'wb') as f:
-            pickle.dump({
-                'model': self.model,
-                'config': self.config,
-                'training_stats': self.training_stats,
-                'feature_names': self.feature_names,
-                'version': '0.2.0'
-            }, f)
-        
+            pickle.dump(save_data, f)
+
         logger.info(f"Model saved successfully to {filepath}")
+        logger.info(f"Saved data includes: model, config, training stats, feature info")
+        logger.info(f"Privacy-compliant: data summary already has count masking applied")
     
     def get_train_stats(self) -> Dict:
         """
