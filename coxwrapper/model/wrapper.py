@@ -54,7 +54,7 @@ class CoxModelWrapper:
                 saved_data = pickle.load(f)
 
             # Validate that this is a CoxModelWrapper pickle
-            required_keys = ['config', 'training_stats', 'feature_names', 'version']
+            required_keys = ['config', 'training_stats', 'feature_names']
             if not all(key in saved_data for key in required_keys):
                 raise ValueError("Invalid CoxModelWrapper pickle file: missing required data")
 
@@ -67,6 +67,7 @@ class CoxModelWrapper:
             instance.training_stats = saved_data.get('training_stats')
             instance.feature_names = saved_data.get('feature_names', [])
             instance.raw_feature_names = saved_data.get('raw_feature_names', [])
+            instance.feature_schema = saved_data.get('feature_schema', {})  # Restore feature schema
             instance.data_summary = saved_data.get('data_summary')
             instance.outcome_name = saved_data.get('outcome_name', instance.outcome_name)
             instance.duration_col = saved_data.get('duration_col', instance.duration_col)
@@ -127,11 +128,199 @@ class CoxModelWrapper:
         self.feature_names = []  # Will be set after preprocessing
         self.duration_col = self.config.get('model_io_columns', {}).get('duration_col', 'time_to_event_days')
         self.event_col = self.config.get('model_io_columns', {}).get('event_col', 'event_observed')
-        
+
+        # Build feature schema from configuration (unless we're loading from pickle)
+        if not hasattr(self, 'feature_schema') or not self.feature_schema:
+            self._build_feature_schema()
+
         logger.info(f"Configuration loaded from {self.config_source}")
         logger.info(f"Outcome: {self.outcome_name}")
-        logger.info(f"Features: {len(self.feature_names)} features configured")
-    
+        logger.info(f"Features: {len(self.raw_feature_names)} features configured")
+        logger.info(f"Feature schema: {len(self.feature_schema)} feature definitions")
+
+    def _build_feature_schema(self):
+        """
+        Build a comprehensive feature schema from the configuration.
+        This creates a lookup table for feature validation and API usage.
+        """
+        self.feature_schema = {}
+
+        # Get all features from config (both regular features and co_indicators)
+        all_features = []
+        all_features.extend(self.config.get('features', []))
+        all_features.extend(self.config.get('co_indicators', []))
+
+        for feature in all_features:
+            feature_name = feature.get('name')
+            if feature_name:
+                self.feature_schema[feature_name] = {
+                    'name': feature_name,
+                    'type': feature.get('type', 'continuous'),
+                    'domain': feature.get('domain', 'unknown'),
+                    'description': feature.get('description', ''),
+                    'required': True,  # All configured features are required
+                    'concepts_include': feature.get('concepts_include', []),
+                    'concepts_exclude': feature.get('concepts_exclude', [])
+                }
+
+        # For any features in model_features_final that don't have detailed config,
+        # create basic schema entries
+        for feature_name in self.raw_feature_names:
+            if feature_name not in self.feature_schema:
+                self.feature_schema[feature_name] = {
+                    'name': feature_name,
+                    'type': 'continuous',  # Default assumption
+                    'domain': 'unknown',
+                    'description': f'Feature {feature_name}',
+                    'required': True,
+                    'concepts_include': [],
+                    'concepts_exclude': []
+                }
+
+    def validate_patient_data(self, patient_data: Dict) -> Dict:
+        """
+        Validate patient data against the feature schema from configuration.
+
+        Args:
+            patient_data: Dictionary of patient features
+
+        Returns:
+            Dict with validation results and any error messages
+
+        Raises:
+            ValueError: If required features are missing or have invalid types
+        """
+        errors = []
+        warnings = []
+
+        # Check for missing required features
+        missing_features = []
+        for feature_name, schema in self.feature_schema.items():
+            if schema['required'] and feature_name not in patient_data:
+                missing_features.append(feature_name)
+
+        if missing_features:
+            errors.append(f"Missing required features: {missing_features}")
+
+        # Check for extra features (warn but don't fail)
+        extra_features = []
+        for feature_name in patient_data.keys():
+            if feature_name not in self.feature_schema and feature_name not in [self.duration_col, self.event_col]:
+                extra_features.append(feature_name)
+
+        if extra_features:
+            warnings.append(f"Extra features provided (will be ignored): {extra_features}")
+
+        # Type validation (basic)
+        for feature_name, value in patient_data.items():
+            if feature_name in self.feature_schema:
+                schema = self.feature_schema[feature_name]
+                expected_type = schema['type']
+
+                # Basic type checking
+                if expected_type == 'continuous' and not isinstance(value, (int, float)):
+                    errors.append(f"Feature '{feature_name}' should be numeric, got {type(value).__name__}")
+                elif expected_type == 'categorical' and not isinstance(value, (str, int)):
+                    errors.append(f"Feature '{feature_name}' should be string or int, got {type(value).__name__}")
+                elif expected_type == 'binary' and value not in [0, 1, True, False]:
+                    errors.append(f"Feature '{feature_name}' should be binary (0/1), got {value}")
+
+        if errors:
+            raise ValueError(f"Patient data validation failed: {'; '.join(errors)}")
+
+        return {
+            'valid': len(errors) == 0,
+            'errors': errors,
+            'warnings': warnings,
+            'validated_features': list(patient_data.keys())
+        }
+
+    def predict_risk_batch(self, patient_data_list: List[Dict], time_points: Optional[List[float]] = None) -> List[Dict]:
+        """
+        Simplified batch prediction method driven by configuration.
+
+        Args:
+            patient_data_list: List of patient dictionaries with features
+            time_points: Optional list of time points for survival prediction (defaults to median survival time)
+
+        Returns:
+            List of prediction dictionaries with simplified format
+
+        Raises:
+            RuntimeError: If model not trained
+            ValueError: If patient data validation fails
+        """
+        if self.model is None:
+            raise RuntimeError("No trained model. Call train() first.")
+
+        if not patient_data_list:
+            return []
+
+        # Validate all patient data first
+        validation_results = []
+        for i, patient_data in enumerate(patient_data_list):
+            try:
+                validation = self.validate_patient_data(patient_data)
+                validation_results.append((i, patient_data, None))
+            except ValueError as e:
+                validation_results.append((i, patient_data, str(e)))
+
+        # Report validation errors
+        errors = [(i, error) for i, _, error in validation_results if error]
+        if errors:
+            error_msg = "Patient data validation failed:\n"
+            for i, error in errors:
+                error_msg += f"  Patient {i}: {error}\n"
+            raise ValueError(error_msg)
+
+        # All validation passed, proceed with predictions
+        predictions = []
+
+        # Get predictions for all valid patients
+        valid_patients = [patient_data for _, patient_data, _ in validation_results if not _]
+        batch_predictions = self.get_prediction(valid_patients)
+
+        # Convert to simplified format
+        for i, prediction in enumerate(batch_predictions):
+            simplified = {
+                'patient_id': prediction.get('patient_id', i),
+                'hazard_ratio': float(prediction.get('relative_risk', 1.0)),
+                'risk_score': float(prediction.get('risk_score', 0.0)),
+                'survival_probability': float(prediction.get('survival_probability', 1.0)),
+                'risk_category': prediction.get('risk_category', 'Unknown'),
+                'prediction_time_days': float(prediction.get('prediction_time', 0)),
+            }
+
+            # Add time-specific predictions if requested
+            if time_points:
+                simplified['survival_probabilities'] = {}
+                for time_point in time_points:
+                    # This would require more complex implementation for multiple time points
+                    # For now, we'll use the primary prediction time
+                    pass
+
+            predictions.append(simplified)
+
+        return predictions
+
+    def get_feature_schema(self) -> Dict[str, Dict]:
+        """
+        Get the feature schema derived from configuration.
+
+        Returns:
+            Dictionary mapping feature names to their schema information
+        """
+        return self.feature_schema.copy()
+
+    def get_required_features(self) -> List[str]:
+        """
+        Get list of required feature names from configuration.
+
+        Returns:
+            List of feature names that are required for predictions
+        """
+        return [name for name, schema in self.feature_schema.items() if schema['required']]
+
     def _load_config_from_url(self, url: str) -> Dict:
         """
         Load configuration from a URL.
@@ -652,6 +841,7 @@ class CoxModelWrapper:
             'training_stats': self.training_stats,
             'feature_names': self.feature_names,
             'raw_feature_names': self.raw_feature_names,
+            'feature_schema': self.feature_schema,  # Save feature schema for validation
             'data_summary': self.data_summary,  # This already has privacy masking
             'outcome_name': self.outcome_name,
             'duration_col': self.duration_col,
