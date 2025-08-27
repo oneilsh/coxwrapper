@@ -191,6 +191,74 @@ def build_domain_events_query(domain_name: str, concept_config: Dict[str, Any], 
     """
     return sql
 
+# --- DATETIME HELPER FUNCTIONS ---
+
+def standardize_datetime_column(df, column_name, make_naive=True):
+    """
+    Standardize a datetime column by:
+    1. Converting to datetime if not already
+    2. Making timezone-naive if requested and if it has timezone info
+
+    Args:
+        df: DataFrame containing the column
+        column_name: Name of the datetime column
+        make_naive: Whether to convert timezone-aware to timezone-naive
+
+    Returns:
+        DataFrame with standardized datetime column
+    """
+    if column_name not in df.columns:
+        return df
+
+    try:
+        # Convert to datetime if not already
+        dt_series = pd.to_datetime(df[column_name], errors='coerce')
+
+        # Make timezone-naive if requested and if it has timezone info
+        if make_naive and hasattr(dt_series, 'dt') and hasattr(dt_series.dt, 'tz') and dt_series.dt.tz is not None:
+            dt_series = dt_series.dt.tz_localize(None)
+
+        df[column_name] = dt_series
+        return df
+
+    except Exception as e:
+        logging.warning(f"Failed to standardize datetime column '{column_name}': {e}")
+        return df
+
+def calculate_age_at_time_0(birth_datetime, time_0_datetime):
+    """
+    Calculate age in years at a specific time point.
+
+    Args:
+        birth_datetime: Birth datetime (can be Series or single value)
+        time_0_datetime: Time_0 datetime (can be Series or single value)
+
+    Returns:
+        Age in years (Series or float)
+    """
+    try:
+        # Ensure both are timezone-naive for consistent subtraction
+        birth_dt = pd.to_datetime(birth_datetime, errors='coerce')
+        time_0_dt = pd.to_datetime(time_0_datetime, errors='coerce')
+
+        # Make timezone-naive if they have timezone info
+        if hasattr(birth_dt, 'dt') and hasattr(birth_dt.dt, 'tz') and birth_dt.dt.tz is not None:
+            birth_dt = birth_dt.dt.tz_localize(None)
+        if hasattr(time_0_dt, 'dt') and hasattr(time_0_dt.dt, 'tz') and time_0_dt.dt.tz is not None:
+            time_0_dt = time_0_dt.dt.tz_localize(None)
+
+        # Calculate age in years
+        age_years = (time_0_dt - birth_dt).dt.days / 365.25
+        return age_years
+
+    except Exception as e:
+        logging.warning(f"Age calculation failed: {e}")
+        # Return NaN for failed calculations
+        if hasattr(birth_datetime, '__len__'):  # Series-like
+            return pd.Series([np.nan] * len(birth_datetime))
+        else:  # Single value
+            return np.nan
+
 # --- NEW: Helper to get all observation periods ---
 def get_observation_periods_query(cdr_path: str, sampling_ratio: float = 1.0) -> str:
     # Add sampling clause if sampling_ratio < 1.0
@@ -425,15 +493,11 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
     person_df['obs_end_dt'] = pd.to_datetime(person_df['observation_period_end_date'], errors='coerce')
     person_df['actual_outcome_dt'] = pd.to_datetime(person_df['actual_outcome_datetime'], errors='coerce')
 
-    # Make timezone-naive if they have timezone info (more robust approach)
-    for col in ['time_0_dt', 'obs_end_dt', 'actual_outcome_dt']:
-        try:
-            # Check if the column has timezone info and convert to naive
-            if hasattr(person_df[col].dt, 'tz') and person_df[col].dt.tz is not None:
-                person_df[col] = person_df[col].dt.tz_localize(None)
-        except (AttributeError, TypeError):
-            # If timezone conversion fails, just leave as is
-            pass
+    # Standardize all datetime columns to be timezone-naive
+    datetime_columns = ['time_0_dt', 'obs_end_dt', 'actual_outcome_dt']
+    for col in datetime_columns:
+        if col in person_df.columns:
+            person_df = standardize_datetime_column(person_df, col, make_naive=True)
 
 
     # Calculate event_observed (1 if outcome occurred AFTER time_0, 0 otherwise)
@@ -457,6 +521,10 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
 
     # --- Step 6: Fetch and Join Features based on time_0 and lookbacks ---
     logging.info("Step 6: Fetching and joining features based on time_0 and lookback windows...")
+
+    # Standardize birth_datetime to be timezone-naive before merging
+    person_df = standardize_datetime_column(person_df, 'birth_datetime', make_naive=True)
+
     final_df = person_df.copy() # Start with the person data and derived outcomes
 
     # Iterate through co_indicators and features from config
@@ -496,11 +564,8 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
             final_df[feature_name] = np.nan # Add column of NaNs if no data
             continue
 
-        # Convert event_datetime to datetime objects and make timezone-naive
-        feature_events_df['event_datetime'] = pd.to_datetime(feature_events_df['event_datetime'], errors='coerce')
-        # Ensure timezone-naive for consistent comparisons
-        if hasattr(feature_events_df['event_datetime'].dt, 'tz') and feature_events_df['event_datetime'].dt.tz is not None:
-            feature_events_df['event_datetime'] = feature_events_df['event_datetime'].dt.tz_localize(None)
+        # Standardize event_datetime to be timezone-naive
+        feature_events_df = standardize_datetime_column(feature_events_df, 'event_datetime', make_naive=True)
 
         # --- Apply Lookback Logic & Consolidate per person_id ---
         # Merge feature events with the time_0 and observation periods
@@ -511,7 +576,8 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
             person_time_0 = group['time_0_dt'].iloc[0]
             obs_start = pd.to_datetime(group['observation_period_start_date'].iloc[0], errors='coerce')
             obs_end = pd.to_datetime(group['observation_period_end_date'].iloc[0], errors='coerce')
-            # Ensure timezone-naive for consistent comparisons
+
+            # Ensure timezone consistency for datetime arithmetic
             if hasattr(obs_start, 'tz_localize') and obs_start.tz is not None:
                 obs_start = obs_start.tz_localize(None)
             if hasattr(obs_end, 'tz_localize') and obs_end.tz is not None:
@@ -578,13 +644,17 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
     # Calculate age at time_0 before cleaning up datetime columns
     if 'birth_datetime' in final_df.columns and 'time_0_dt' in final_df.columns:
         logging.info("Calculating age at time_0...")
-        # Calculate age in years at time_0
-        age_at_time_0 = (final_df['time_0_dt'] - final_df['birth_datetime']).dt.days / 365.25
+        age_at_time_0 = calculate_age_at_time_0(final_df['birth_datetime'], final_df['time_0_dt'])
         final_df['current_age'] = age_at_time_0
-        logging.info(f"Age calculation completed. Range: {age_at_time_0.min():.1f} - {age_at_time_0.max():.1f} years")
+
+        # Log age statistics (handling NaN values)
+        valid_ages = age_at_time_0.dropna()
+        if not valid_ages.empty:
+            logging.info(f"Age calculation completed. Range: {valid_ages.min():.1f} - {valid_ages.max():.1f} years")
+        else:
+            logging.warning("No valid ages calculated")
     else:
         logging.warning("Missing birth_datetime or time_0_dt columns for age calculation")
-        # Fallback: use nan
         final_df['current_age'] = np.nan
 
     # Clean up temporary datetime columns
