@@ -477,8 +477,9 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
             continue
 
         logging.info(f"Extracting feature: {feature_name} from domain: {feature_domain}")
-        # Build query to get all events for this feature (with SQL-level sampling!)
-        raw_events_query = build_domain_events_query(feature_domain, feature_config, cdr_path, sampling_ratio)
+        # Build query to get events for this feature
+        # Note: We're already querying only for sampled patients, so no additional sampling needed
+        raw_events_query = build_domain_events_query(feature_domain, feature_config, cdr_path, sampling_ratio=1.0)
         if not raw_events_query: # Skip if build_domain_events_query returned empty (unsupported domain)
             continue
 
@@ -486,16 +487,19 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
         logging.info(f"Raw events for {feature_name} loaded. Shape: {feature_events_df.shape}")
 
         if sampling_ratio < 1.0:
-            estimated_full_size = int(feature_events_df.shape[0] / sampling_ratio)
-            logging.info(f"SQL sampling applied: loaded {feature_events_df.shape[0]:,} events "
-                        f"(estimated {estimated_full_size:,} without sampling)")
+            # Since we already sampled patients, this is the expected smaller size
+            logging.info(f"Feature events loaded for sampled patients: {feature_events_df.shape[0]:,} events "
+                        f"(sampled from {int(len(person_df) / sampling_ratio):,} patients)")
 
         if feature_events_df.empty:
             final_df[feature_name] = np.nan # Add column of NaNs if no data
             continue
 
-        # Convert event_datetime to datetime objects
-        feature_events_df['event_datetime'] = pd.to_datetime(feature_events_df['event_datetime'])
+        # Convert event_datetime to datetime objects and make timezone-naive
+        feature_events_df['event_datetime'] = pd.to_datetime(feature_events_df['event_datetime'], errors='coerce')
+        # Ensure timezone-naive for consistent comparisons
+        if hasattr(feature_events_df['event_datetime'].dt, 'tz') and feature_events_df['event_datetime'].dt.tz is not None:
+            feature_events_df['event_datetime'] = feature_events_df['event_datetime'].dt.tz_localize(None)
 
         # --- Apply Lookback Logic & Consolidate per person_id ---
         # Merge feature events with the time_0 and observation periods
@@ -504,8 +508,13 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
         feature_values = []
         for pid, group in merged_events_df.groupby('person_id'):
             person_time_0 = group['time_0_dt'].iloc[0]
-            obs_start = pd.to_datetime(group['observation_period_start_date'].iloc[0])
-            obs_end = pd.to_datetime(group['observation_period_end_date'].iloc[0])
+            obs_start = pd.to_datetime(group['observation_period_start_date'].iloc[0], errors='coerce')
+            obs_end = pd.to_datetime(group['observation_period_end_date'].iloc[0], errors='coerce')
+            # Ensure timezone-naive for consistent comparisons
+            if hasattr(obs_start, 'tz_localize') and obs_start.tz is not None:
+                obs_start = obs_start.tz_localize(None)
+            if hasattr(obs_end, 'tz_localize') and obs_end.tz is not None:
+                obs_end = obs_end.tz_localize(None)
 
             # Filter events to be within the allowed lookback window relative to time_0
             # Define lookback based on feature type (from config.yaml for now)
