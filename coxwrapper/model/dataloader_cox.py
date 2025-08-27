@@ -116,7 +116,7 @@ def _get_concept_filter_sql(domain_table_alias: str, concept_id_col_name: str, c
 # --- MODIFIED: build_domain_query to be more flexible and return raw events ---
 # This function will now focus on pulling raw events within a person's record
 # and then we'll apply time window filtering in load_data_from_bigquery.
-def build_domain_events_query(domain_name: str, concept_config: Dict[str, Any], cdr_path: str) -> str:
+def build_domain_events_query(domain_name: str, concept_config: Dict[str, Any], cdr_path: str, sampling_ratio: float = 1.0) -> str:
     """
     Builds a SQL query to extract all relevant events for a given domain and concept configuration
     (e.g., all COPD diagnoses, all BMI measurements).
@@ -169,6 +169,12 @@ def build_domain_events_query(domain_name: str, concept_config: Dict[str, Any], 
     if where_clauses:
         final_where_clause = f"WHERE {' AND '.join(where_clauses)}"
 
+    # Add sampling clause if sampling_ratio < 1.0
+    sampling_clause = ""
+    if sampling_ratio < 1.0:
+        sampling_percent = int(sampling_ratio * 100)
+        sampling_clause = f"AND MOD(ABS(FARM_FINGERPRINT(CAST(t.person_id AS STRING))), 100) < {sampling_percent}"
+
     sql = f"""
     SELECT
         t.person_id,
@@ -181,6 +187,7 @@ def build_domain_events_query(domain_name: str, concept_config: Dict[str, Any], 
     FROM
         {domain_table} t
     {final_where_clause}
+    {sampling_clause}
     """
     return sql
 
@@ -470,13 +477,18 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
             continue
 
         logging.info(f"Extracting feature: {feature_name} from domain: {feature_domain}")
-        # Build query to get all events for this feature
-        raw_events_query = build_domain_events_query(feature_domain, feature_config, cdr_path)
+        # Build query to get all events for this feature (with SQL-level sampling!)
+        raw_events_query = build_domain_events_query(feature_domain, feature_config, cdr_path, sampling_ratio)
         if not raw_events_query: # Skip if build_domain_events_query returned empty (unsupported domain)
             continue
 
         feature_events_df = pd.read_gbq(raw_events_query)
         logging.info(f"Raw events for {feature_name} loaded. Shape: {feature_events_df.shape}")
+
+        if sampling_ratio < 1.0:
+            estimated_full_size = int(feature_events_df.shape[0] / sampling_ratio)
+            logging.info(f"SQL sampling applied: loaded {feature_events_df.shape[0]:,} events "
+                        f"(estimated {estimated_full_size:,} without sampling)")
 
         if feature_events_df.empty:
             final_df[feature_name] = np.nan # Add column of NaNs if no data
