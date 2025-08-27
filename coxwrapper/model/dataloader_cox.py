@@ -268,50 +268,81 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
     
     logging.info("Step 4: Determining random time_0 for each person...")
     # Join observation periods with outcome events to filter valid time_0 ranges
+    # Use left join to include all observation periods, even those without outcomes
+    logging.info("Merging observation periods with outcome events...")
+    logging.info(f"  Observation periods: {len(obs_period_df)} rows")
+    logging.info(f"  Outcome events: {len(all_outcome_events_df)} rows")
+
     person_obs_outcome = pd.merge(obs_period_df, all_outcome_events_df, on='person_id', how='left')
+    logging.info(f"  After merge: {len(person_obs_outcome)} rows")
 
-    # Calculate potential valid time_0 candidates
-    time_0_candidates = []
-    today = datetime.today().date() # Use a fixed 'today' for consistency
+    # Vectorized date operations for better performance
+    logging.info("Performing vectorized time_0 calculations...")
 
-    for idx, row in person_obs_outcome.iterrows():
-        person_id = row['person_id']
-        obs_start = row['observation_period_start_date']
-        obs_end = row['observation_period_end_date']
-        outcome_date = row['outcome_datetime'] # This is NaN if no outcome for this person
+    # Convert dates to datetime once
+    person_obs_outcome['obs_start'] = pd.to_datetime(person_obs_outcome['observation_period_start_date'])
+    person_obs_outcome['obs_end'] = pd.to_datetime(person_obs_outcome['observation_period_end_date'])
+    person_obs_outcome['outcome_date'] = pd.to_datetime(person_obs_outcome['outcome_datetime'])
 
-        # Define the earliest possible time_0 for this observation period (after min lookback)
-        earliest_time_0 = obs_start + timedelta(days=MIN_LOOKBACK_DAYS)
-        
-        # Define the latest possible time_0 for this observation period (before min follow-up)
-        # Also ensure time_0 is in the past
-        latest_time_0 = min(obs_end - timedelta(days=MIN_FOLLOWUP_DAYS), today)
+    today = datetime.today().date()
 
-        if earliest_time_0 > latest_time_0: # Not enough valid window
-            continue
+    # Calculate earliest and latest possible time_0 for each person
+    person_obs_outcome['earliest_time_0'] = person_obs_outcome['obs_start'] + pd.Timedelta(days=MIN_LOOKBACK_DAYS)
+    person_obs_outcome['latest_time_0_raw'] = person_obs_outcome['obs_end'] - pd.Timedelta(days=MIN_FOLLOWUP_DAYS)
 
-        # If there's an outcome, time_0 must be *before* the outcome date
-        if pd.notna(outcome_date):
-            latest_time_0 = min(latest_time_0, outcome_date.date() - timedelta(days=1)) # time_0 must be at least 1 day before outcome
+    # Ensure time_0 is not in the future
+    person_obs_outcome['latest_time_0'] = person_obs_outcome['latest_time_0_raw'].dt.date.clip(upper=today)
 
-        if earliest_time_0 > latest_time_0: # After outcome filtering, not enough valid window
-            continue
+    # If there's an outcome, time_0 must be before the outcome date
+    mask_has_outcome = person_obs_outcome['outcome_date'].notna()
+    person_obs_outcome.loc[mask_has_outcome, 'latest_time_0'] = \
+        person_obs_outcome.loc[mask_has_outcome, ['latest_time_0', 'outcome_date']].min(axis=1).dt.date - pd.Timedelta(days=1)
 
-        # Generate a random time_0 within the valid range for this observation period
-        # Use a consistent seed if deterministic random is needed for testing, otherwise remove
-        random_day_offset = np.random.randint(0, (latest_time_0 - earliest_time_0).days + 1)
-        selected_time_0 = earliest_time_0 + timedelta(days=random_day_offset)
-        
-        # Store for later aggregation
-        time_0_candidates.append({
-            'person_id': person_id,
-            'time_0': selected_time_0.isoformat(), # Store as string for easier BigQuery handling
-            'observation_period_start_date': obs_start.isoformat(),
-            'observation_period_end_date': obs_end.isoformat(),
-            'actual_outcome_datetime': outcome_date.isoformat() if pd.notna(outcome_date) else None # Keep actual outcome date
-        })
-    
-    time_0_df = pd.DataFrame(time_0_candidates)
+    # Filter valid time windows
+    valid_window_mask = person_obs_outcome['earliest_time_0'].dt.date <= person_obs_outcome['latest_time_0']
+    person_obs_outcome = person_obs_outcome[valid_window_mask]
+    logging.info(f"  Valid time windows: {len(person_obs_outcome)} patients ({len(person_obs_outcome)/len(obs_period_df)*100:.1f}% of observation periods)")
+
+    if person_obs_outcome.empty:
+        logging.warning("No persons with valid time windows found.")
+        return pd.DataFrame()
+
+    # Calculate time window sizes for random sampling
+    person_obs_outcome['window_days'] = (person_obs_outcome['latest_time_0'] - person_obs_outcome['earliest_time_0'].dt.date).dt.days + 1
+    person_obs_outcome = person_obs_outcome[person_obs_outcome['window_days'] > 0]
+
+    if person_obs_outcome.empty:
+        logging.warning("No persons with positive time windows found.")
+        return pd.DataFrame()
+
+    # Generate random offsets within valid windows
+    np.random.seed(42)  # For reproducibility
+    person_obs_outcome['random_offset'] = person_obs_outcome['window_days'].apply(lambda days: np.random.randint(0, days))
+    person_obs_outcome['selected_time_0'] = person_obs_outcome['earliest_time_0'] + pd.to_timedelta(person_obs_outcome['random_offset'], unit='D')
+
+    # Create time_0 DataFrame efficiently
+    time_0_df = person_obs_outcome[[
+        'person_id',
+        'selected_time_0',
+        'obs_start',
+        'obs_end',
+        'outcome_date'
+    ]].rename(columns={
+        'selected_time_0': 'time_0',
+        'obs_start': 'observation_period_start_date',
+        'obs_end': 'observation_period_end_date',
+        'outcome_date': 'actual_outcome_datetime'
+    })
+
+    # Convert to ISO format strings for BigQuery compatibility
+    time_0_df['time_0'] = time_0_df['time_0'].dt.strftime('%Y-%m-%dT%H:%M:%S')
+    time_0_df['observation_period_start_date'] = time_0_df['observation_period_start_date'].dt.strftime('%Y-%m-%dT%H:%M:%S')
+    time_0_df['observation_period_end_date'] = time_0_df['observation_period_end_date'].dt.strftime('%Y-%m-%dT%H:%M:%S')
+
+    # Handle NaN values in outcome datetime
+    time_0_df['actual_outcome_datetime'] = time_0_df['actual_outcome_datetime'].apply(
+        lambda x: x.strftime('%Y-%m-%dT%H:%M:%S') if pd.notna(x) else None
+    )
     
     # Select one time_0 per person if multiple observation periods/outcomes resulted in multiple candidates
     # This just picks one if there are overlaps, the prior logic ensures it's valid per person
@@ -321,10 +352,17 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
 
     # Merge time_0 back into the base person_df
     person_df = pd.merge(person_df, time_0_df[['person_id', 'time_0', 'observation_period_start_date', 'observation_period_end_date', 'actual_outcome_datetime']], on='person_id', how='inner')
-    
+
     if person_df.empty:
         logging.warning("No persons with valid time_0 found after filtering. Returning empty DataFrame.")
         return pd.DataFrame()
+
+    # Optional: Add sampling for very large datasets to improve performance
+    # This can be controlled via configuration
+    max_patients = config.get('max_patients', None)
+    if max_patients and len(person_df) > max_patients:
+        logging.info(f"Sampling {max_patients} patients from {len(person_df)} total (for performance)")
+        person_df = person_df.sample(n=max_patients, random_state=42).reset_index(drop=True)
 
 
     # --- Step 5: Derive Outcome (time_to_event_days, event_observed) ---
