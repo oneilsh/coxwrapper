@@ -185,7 +185,13 @@ def build_domain_events_query(domain_name: str, concept_config: Dict[str, Any], 
     return sql
 
 # --- NEW: Helper to get all observation periods ---
-def get_observation_periods_query(cdr_path: str) -> str:
+def get_observation_periods_query(cdr_path: str, sampling_ratio: float = 1.0) -> str:
+    # Add sampling clause if sampling_ratio < 1.0
+    sampling_clause = ""
+    if sampling_ratio < 1.0:
+        sampling_percent = int(sampling_ratio * 100)
+        sampling_clause = f"AND MOD(ABS(FARM_FINGERPRINT(CAST(person_id AS STRING))), 100) < {sampling_percent}"
+
     return f"""
     SELECT
         person_id,
@@ -196,10 +202,11 @@ def get_observation_periods_query(cdr_path: str) -> str:
     WHERE
         observation_period_start_date IS NOT NULL AND observation_period_end_date IS NOT NULL
         AND DATE_DIFF(observation_period_end_date, observation_period_start_date, DAY) >= 0
+        {sampling_clause}
     """
 
 # --- NEW: Helper to get all outcome events ---
-def get_all_outcome_events_query(outcome_config: Dict[str, Any], cdr_path: str) -> str:
+def get_all_outcome_events_query(outcome_config: Dict[str, Any], cdr_path: str, sampling_ratio: float = 1.0) -> str:
     outcome_domain = outcome_config['domain']
     outcome_concept_id_col_name = 'condition_concept_id' # Assuming condition_occurrence for outcome
     outcome_date_col_name = 'condition_start_datetime'
@@ -215,6 +222,12 @@ def get_all_outcome_events_query(outcome_config: Dict[str, Any], cdr_path: str) 
     if where_clauses:
         final_where_clause = f"WHERE {' AND '.join(where_clauses)}"
 
+    # Add sampling clause if sampling_ratio < 1.0
+    sampling_clause = ""
+    if sampling_ratio < 1.0:
+        sampling_percent = int(sampling_ratio * 100)
+        sampling_clause = f"AND MOD(ABS(FARM_FINGERPRINT(CAST(t.person_id AS STRING))), 100) < {sampling_percent}"
+
     return f"""
     SELECT
         t.person_id,
@@ -222,10 +235,11 @@ def get_all_outcome_events_query(outcome_config: Dict[str, Any], cdr_path: str) 
     FROM
         `{cdr_path}.{outcome_domain}` t
     {final_where_clause}
+    {sampling_clause}
     """
 
 
-def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
+def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0) -> pd.DataFrame:
     """
     Loads data from Google BigQuery based on the provided configuration.
     Uses pd.read_gbq() compatible with AoU environment authentication.
@@ -234,7 +248,7 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
     cdr_path = get_aou_cdr_path()
 
     logging.info("Step 1: Fetching base person demographic data.")
-    base_person_query = build_person_base_query(config)
+    base_person_query = build_person_base_query(config, sampling_ratio)
     person_df = pd.read_gbq(base_person_query)
     logging.info(f"Base person data loaded. Shape: {person_df.shape}")
 
@@ -242,14 +256,22 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
         logging.warning("No persons found matching base cohort criteria. Returning empty DataFrame.")
         return pd.DataFrame()
 
-    # Early sampling for development/testing (before expensive BigQuery operations)
+    # SQL-level sampling for development/testing (much more efficient!)
+    sampling_ratio = config.get('sampling_ratio', 1.0)  # 1.0 = no sampling, 0.1 = 10% sampling
+    if sampling_ratio < 1.0:
+        logging.info(f"SQL sampling applied (sampling_ratio={sampling_ratio})")
+        # Note: We'll apply sampling at the SQL level in each query
+    else:
+        logging.info("No SQL sampling applied (sampling_ratio=1.0)")
+
+    # Keep max_patients for post-processing if needed
     max_patients = config.get('max_patients', None)
     if max_patients and len(person_df) > max_patients:
-        logging.info(f"Early sampling: Taking {max_patients} patients from {len(person_df)} total (for development/testing)")
+        logging.info(f"Post-processing sampling: Taking {max_patients} patients from {len(person_df)} total")
         person_df = person_df.sample(n=max_patients, random_state=42).reset_index(drop=True)
 
     logging.info("Step 2: Fetching observation periods for all persons.")
-    obs_period_query = get_observation_periods_query(cdr_path)
+    obs_period_query = get_observation_periods_query(cdr_path, sampling_ratio)
     obs_period_df = pd.read_gbq(obs_period_query)
     logging.info(f"Observation periods loaded. Shape: {obs_period_df.shape}")
 
@@ -258,7 +280,7 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
     if not outcome_config or 'domain' not in outcome_config:
         raise ValueError("Outcome configuration missing or incomplete in YAML.")
 
-    all_outcome_events_query = get_all_outcome_events_query(outcome_config, cdr_path)
+    all_outcome_events_query = get_all_outcome_events_query(outcome_config, cdr_path, sampling_ratio)
     all_outcome_events_df = pd.read_gbq(all_outcome_events_query)
     logging.info(f"All outcome events loaded. Shape: {all_outcome_events_df.shape}")
 
@@ -523,7 +545,7 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
     return final_df
 
 # --- build_person_base_query (remains mostly same, but ensures necessary cols) ---
-def build_person_base_query(config: Dict[str, Any]) -> str:
+def build_person_base_query(config: Dict[str, Any], sampling_ratio: float = 1.0) -> str:
     """
     Builds the base SQL query for the person table, incorporating cohort definition
     from the configuration.
@@ -575,11 +597,18 @@ def build_person_base_query(config: Dict[str, Any]) -> str:
 
     final_where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
 
+    # Add sampling clause if sampling_ratio < 1.0
+    sampling_clause = ""
+    if sampling_ratio < 1.0:
+        sampling_percent = int(sampling_ratio * 100)
+        sampling_clause = f"AND MOD(ABS(FARM_FINGERPRINT(CAST(person.person_id AS STRING))), 100) < {sampling_percent}"
+
     sql_query = f"""
     SELECT
         {', '.join(select_clauses)}
     {os.linesep.join(from_join_clauses)}
     {final_where_clause}
+    {sampling_clause}
     """
     return sql_query
 
@@ -641,7 +670,8 @@ if __name__ == "__main__":
         logging.info("Configuration loaded successfully.")
         
         logging.info("Loading data from BigQuery with cohort construction and time_0 logic...")
-        data_df = load_data_from_bigquery(config)
+        sampling_ratio = config.get('sampling_ratio', 1.0)
+        data_df = load_data_from_bigquery(config, sampling_ratio)
         
         logging.info(f"Data loaded from BigQuery. Shape: {data_df.shape}")
         if not data_df.empty:

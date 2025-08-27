@@ -365,7 +365,8 @@ class CoxModelWrapper:
         else:
             logger.info("Loading data from BigQuery...")
             try:
-                self.data = load_data_from_bigquery(self.config)
+                sampling_ratio = self.config.get('sampling_ratio', 1.0)
+                self.data = load_data_from_bigquery(self.config, sampling_ratio)
                 logger.info(f"Data loaded successfully: {self.data.shape[0]} rows, {self.data.shape[1]} columns")
             except Exception as e:
                 logger.error(f"Failed to load data: {e}")
