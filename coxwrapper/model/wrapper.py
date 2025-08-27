@@ -312,6 +312,21 @@ class CoxModelWrapper:
         """
         return self.feature_schema.copy()
 
+    def print_feature_schema(self) -> None:
+        """
+        Print a nicely formatted feature schema summary.
+        Only shows parentheses if there's actually a description.
+        """
+        schema = self.get_feature_schema()
+        print(f"Feature schema ({len(schema)} features):")
+
+        for name, info in schema.items():
+            description = info.get('description', '').strip()
+            if description:
+                print(f"  {name}: {info['type']} ({description})")
+            else:
+                print(f"  {name}: {info['type']}")
+
     def get_required_features(self) -> List[str]:
         """
         Get list of required feature names from configuration.
