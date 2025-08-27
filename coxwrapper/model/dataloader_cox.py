@@ -258,17 +258,18 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
 
     # SQL-level sampling for development/testing (much more efficient!)
     sampling_ratio = config.get('sampling_ratio', 1.0)  # 1.0 = no sampling, 0.1 = 10% sampling
-    if sampling_ratio < 1.0:
-        logging.info(f"SQL sampling applied (sampling_ratio={sampling_ratio})")
-        # Note: We'll apply sampling at the SQL level in each query
-    else:
-        logging.info("No SQL sampling applied (sampling_ratio=1.0)")
 
-    # Keep max_patients for post-processing if needed
-    max_patients = config.get('max_patients', None)
-    if max_patients and len(person_df) > max_patients:
-        logging.info(f"Post-processing sampling: Taking {max_patients} patients from {len(person_df)} total")
-        person_df = person_df.sample(n=max_patients, random_state=42).reset_index(drop=True)
+    # Remove max_patients entirely - rely only on sampling_ratio
+    if 'max_patients' in config:
+        logging.warning("⚠️  'max_patients' is deprecated. Use 'sampling_ratio' for SQL-level sampling instead.")
+        config.pop('max_patients')  # Remove it to avoid confusion
+
+    if sampling_ratio < 1.0:
+        sampling_percent = int(sampling_ratio * 100)
+        logging.info(f"SQL sampling applied: {sampling_percent}% of data (sampling_ratio={sampling_ratio})")
+        # Note: SQL sampling is applied at the query level in BigQuery
+    else:
+        logging.info("No SQL sampling applied (sampling_ratio=1.0) - full dataset will be loaded")
 
     logging.info("Step 2: Fetching observation periods for all persons.")
     obs_period_query = get_observation_periods_query(cdr_path, sampling_ratio)
@@ -325,10 +326,16 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
     mask_has_outcome = person_obs_outcome['outcome_date'].notna()
 
     # For patients with outcomes, take the minimum of latest_time_0 and outcome_date, then subtract 1 day
+    # Ensure consistent date type handling
     for idx in person_obs_outcome[mask_has_outcome].index:
         latest_time = person_obs_outcome.loc[idx, 'latest_time_0']
-        outcome_time = person_obs_outcome.loc[idx, 'outcome_date'].date()
-        person_obs_outcome.loc[idx, 'latest_time_0'] = min(latest_time, outcome_time - timedelta(days=1))
+        outcome_datetime = person_obs_outcome.loc[idx, 'outcome_date']
+        if pd.notna(outcome_datetime):
+            outcome_time = outcome_datetime.date() - timedelta(days=1)
+            person_obs_outcome.loc[idx, 'latest_time_0'] = min(latest_time, outcome_time)
+
+    # Ensure latest_time_0 is consistently date type for comparison
+    person_obs_outcome['latest_time_0'] = pd.to_datetime(person_obs_outcome['latest_time_0']).dt.date
 
     # Filter valid time windows
     valid_window_mask = person_obs_outcome['earliest_time_0'].dt.date <= person_obs_outcome['latest_time_0']
@@ -340,7 +347,10 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
         return pd.DataFrame()
 
     # Calculate time window sizes for random sampling
-    person_obs_outcome['window_days'] = (person_obs_outcome['latest_time_0'] - person_obs_outcome['earliest_time_0'].dt.date).dt.days + 1
+    # Convert both to datetime for consistent calculation
+    latest_dt = pd.to_datetime(person_obs_outcome['latest_time_0'])
+    earliest_dt = pd.to_datetime(person_obs_outcome['earliest_time_0'])
+    person_obs_outcome['window_days'] = (latest_dt - earliest_dt).dt.days + 1
     person_obs_outcome = person_obs_outcome[person_obs_outcome['window_days'] > 0]
 
     if person_obs_outcome.empty:
@@ -403,12 +413,20 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
     # person_df['time_0_dt'] = pd.to_datetime(person_df['time_0']).dt.tz_localize(None) # Make timezone-naive
     # person_df['obs_end_dt'] = pd.to_datetime(person_df['observation_period_end_date']).dt.tz_localize(None) # Make timezone-naive
     # person_df['actual_outcome_dt'] = pd.to_datetime(person_df['actual_outcome_datetime']).dt.tz_localize(None) # Make timezone-naive
-    common_datetime_format = "%Y-%m-%dT%H:%M:%S.%f%z"
+    # Parse datetime strings without assuming specific format (more robust)
+    person_df['time_0_dt'] = pd.to_datetime(person_df['time_0'], errors='coerce')
+    person_df['obs_end_dt'] = pd.to_datetime(person_df['observation_period_end_date'], errors='coerce')
+    person_df['actual_outcome_dt'] = pd.to_datetime(person_df['actual_outcome_datetime'], errors='coerce')
 
-    # Now, use the format argument in each call to pd.to_datetime
-    person_df['time_0_dt'] = pd.to_datetime(person_df['time_0'], format=common_datetime_format, errors='coerce').dt.tz_localize(None)
-    person_df['obs_end_dt'] = pd.to_datetime(person_df['observation_period_end_date'], format=common_datetime_format, errors='coerce').dt.tz_localize(None)
-    person_df['actual_outcome_dt'] = pd.to_datetime(person_df['actual_outcome_datetime'], format=common_datetime_format, errors='coerce').dt.tz_localize(None)
+    # Make timezone-naive if they have timezone info (more robust approach)
+    for col in ['time_0_dt', 'obs_end_dt', 'actual_outcome_dt']:
+        try:
+            # Check if the column has timezone info and convert to naive
+            if hasattr(person_df[col].dt, 'tz') and person_df[col].dt.tz is not None:
+                person_df[col] = person_df[col].dt.tz_localize(None)
+        except (AttributeError, TypeError):
+            # If timezone conversion fails, just leave as is
+            pass
 
 
     # Calculate event_observed (1 if outcome occurred AFTER time_0, 0 otherwise)
