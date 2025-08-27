@@ -242,6 +242,12 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
         logging.warning("No persons found matching base cohort criteria. Returning empty DataFrame.")
         return pd.DataFrame()
 
+    # Early sampling for development/testing (before expensive BigQuery operations)
+    max_patients = config.get('max_patients', None)
+    if max_patients and len(person_df) > max_patients:
+        logging.info(f"Early sampling: Taking {max_patients} patients from {len(person_df)} total (for development/testing)")
+        person_df = person_df.sample(n=max_patients, random_state=42).reset_index(drop=True)
+
     logging.info("Step 2: Fetching observation periods for all persons.")
     obs_period_query = get_observation_periods_query(cdr_path)
     obs_period_df = pd.read_gbq(obs_period_query)
@@ -295,8 +301,12 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
 
     # If there's an outcome, time_0 must be before the outcome date
     mask_has_outcome = person_obs_outcome['outcome_date'].notna()
-    person_obs_outcome.loc[mask_has_outcome, 'latest_time_0'] = \
-        person_obs_outcome.loc[mask_has_outcome, ['latest_time_0', 'outcome_date']].min(axis=1).dt.date - pd.Timedelta(days=1)
+
+    # For patients with outcomes, take the minimum of latest_time_0 and outcome_date, then subtract 1 day
+    for idx in person_obs_outcome[mask_has_outcome].index:
+        latest_time = person_obs_outcome.loc[idx, 'latest_time_0']
+        outcome_time = person_obs_outcome.loc[idx, 'outcome_date'].date()
+        person_obs_outcome.loc[idx, 'latest_time_0'] = min(latest_time, outcome_time - timedelta(days=1))
 
     # Filter valid time windows
     valid_window_mask = person_obs_outcome['earliest_time_0'].dt.date <= person_obs_outcome['latest_time_0']
@@ -357,11 +367,11 @@ def load_data_from_bigquery(config: Dict[str, Any]) -> pd.DataFrame:
         logging.warning("No persons with valid time_0 found after filtering. Returning empty DataFrame.")
         return pd.DataFrame()
 
-    # Optional: Add sampling for very large datasets to improve performance
+    # Optional: Add sampling for development/testing with large datasets
     # This can be controlled via configuration
     max_patients = config.get('max_patients', None)
     if max_patients and len(person_df) > max_patients:
-        logging.info(f"Sampling {max_patients} patients from {len(person_df)} total (for performance)")
+        logging.info(f"Sampling {max_patients} patients from {len(person_df)} total (for development/testing)")
         person_df = person_df.sample(n=max_patients, random_state=42).reset_index(drop=True)
 
 
