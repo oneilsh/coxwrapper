@@ -263,7 +263,7 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
         logging.warning("No persons found matching base cohort criteria. Returning empty DataFrame.")
         return pd.DataFrame()
 
-    # SQL-level sampling for development/testing (much more efficient!)
+    # Hash-based SQL sampling for development/testing (much more efficient!)
     sampling_ratio = config.get('sampling_ratio', 1.0)  # 1.0 = no sampling, 0.1 = 10% sampling
 
     # Remove max_patients entirely - rely only on sampling_ratio
@@ -273,8 +273,8 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
 
     if sampling_ratio < 1.0:
         sampling_percent = int(sampling_ratio * 100)
-        logging.info(f"SQL sampling applied: {sampling_percent}% of data (sampling_ratio={sampling_ratio})")
-        # Note: SQL sampling is applied at the query level in BigQuery
+        logging.info(f"Hash-based SQL sampling: {sampling_percent}% of patients across all tables")
+        logging.info("Same patient set will be sampled from person, observations, measurements, etc.")
     else:
         logging.info("No SQL sampling applied (sampling_ratio=1.0) - full dataset will be loaded")
 
@@ -477,9 +477,9 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
             continue
 
         logging.info(f"Extracting feature: {feature_name} from domain: {feature_domain}")
-        # Build query to get events for this feature
-        # Note: We're already querying only for sampled patients, so no additional sampling needed
-        raw_events_query = build_domain_events_query(feature_domain, feature_config, cdr_path, sampling_ratio=1.0)
+        # Build query to get events for this feature using the same hash-based sampling
+        # This ensures we get data for the exact same sampled patients across all tables
+        raw_events_query = build_domain_events_query(feature_domain, feature_config, cdr_path, sampling_ratio)
         if not raw_events_query: # Skip if build_domain_events_query returned empty (unsupported domain)
             continue
 
@@ -487,9 +487,10 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
         logging.info(f"Raw events for {feature_name} loaded. Shape: {feature_events_df.shape}")
 
         if sampling_ratio < 1.0:
-            # Since we already sampled patients, this is the expected smaller size
-            logging.info(f"Feature events loaded for sampled patients: {feature_events_df.shape[0]:,} events "
-                        f"(sampled from {int(len(person_df) / sampling_ratio):,} patients)")
+            # Hash-based sampling applied at SQL level - should be much smaller from the start
+            estimated_full_size = int(feature_events_df.shape[0] / sampling_ratio)
+            logging.info(f"SQL sampling applied: loaded {feature_events_df.shape[0]:,} events "
+                        f"(estimated {estimated_full_size:,} without sampling)")
 
         if feature_events_df.empty:
             final_df[feature_name] = np.nan # Add column of NaNs if no data
