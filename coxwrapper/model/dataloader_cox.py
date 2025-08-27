@@ -575,10 +575,23 @@ def load_data_from_bigquery(config: Dict[str, Any], sampling_ratio: float = 1.0)
 
     logging.info(f"Final data shape after feature joining: {final_df.shape}")
     
+    # Calculate age at time_0 before cleaning up datetime columns
+    if 'birth_datetime' in final_df.columns and 'time_0_dt' in final_df.columns:
+        logging.info("Calculating age at time_0...")
+        # Calculate age in years at time_0
+        age_at_time_0 = (final_df['time_0_dt'] - final_df['birth_datetime']).dt.days / 365.25
+        final_df['current_age'] = age_at_time_0
+        logging.info(f"Age calculation completed. Range: {age_at_time_0.min():.1f} - {age_at_time_0.max():.1f} years")
+    else:
+        logging.warning("Missing birth_datetime or time_0_dt columns for age calculation")
+        # Fallback: use nan
+        final_df['current_age'] = np.nan
+
     # Clean up temporary datetime columns
     final_df = final_df.drop(columns=['time_0_dt', 'obs_end_dt', 'actual_outcome_dt',
-                                      'observation_period_start_date', 'observation_period_end_date', 'actual_outcome_datetime'], errors='ignore')
-    
+                                      'observation_period_start_date', 'observation_period_end_date',
+                                      'actual_outcome_datetime', 'birth_datetime'], errors='ignore')
+
     # Rename 'current_age' to 'age_at_time_0' to reflect its meaning
     final_df = final_df.rename(columns={'current_age': 'age_at_time_0'})
 
